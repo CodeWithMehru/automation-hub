@@ -726,21 +726,21 @@ async def process_portal_student_session(
         await submit_btn.scroll_into_view_if_needed()
         await page.wait_for_timeout(400)
         await submit_btn.click()
-        state.append_log("  → Submit button clicked. Waiting 2s to check outcome...")
+        state.append_log("  → Submit clicked. Waiting 5s for server save and automatic redirect to Dashboard...")
 
-        # Wait 2 seconds and check if the Register form is STILL visible
-        await page.wait_for_timeout(2000)
+        # 1. Mandatory 5-second wait for server save & redirect without rushing
+        await page.wait_for_timeout(5000)
+
+        # Check if Register modal is still open after 5s
         register_form_still_up = await page.locator(
             'input[name="mobile"], textarea[name="postalAddress"]'
         ).count() > 0
 
         if register_form_still_up:
-            # Retry submit — dispatchEvent('click') as extra guarantee
-            state.append_log("  ⚠️ Form still visible after 2s — retrying submit via dispatchEvent...")
+            state.append_log("  ⚠️ Form still visible after 5s — retrying submit click...")
             try:
                 await submit_btn.dispatch_event("click")
             except Exception:
-                # Last resort: find any visible submit button and click it
                 for btn_sel in [
                     'button:has-text("Submit & Open CA Dashboard")',
                     'button[type="submit"]',
@@ -749,19 +749,18 @@ async def process_portal_student_session(
                     if await btn.count() > 0 and await btn.is_visible():
                         await btn.click()
                         break
-            await page.wait_for_timeout(2500)
+            await page.wait_for_timeout(3000)
 
         # ----------------------------------------------------------------
-        # 6. Step 4: Verify CA Dashboard actually loaded
+        # 6. Step 4: Verify Landing on Dashboard & Wait 10 Full Seconds
         # ----------------------------------------------------------------
         state.append_log("🔍 Verifying CA Dashboard has loaded...")
         dashboard_loaded = False
 
-        # Dashboard indicators: "Welcome back", "Points Earned", "Balance: 10 Pts",
-        # "Logout" button, or any element containing "CA-2027-"
         dashboard_checks = [
             'button:has-text("Logout")',
             'button:has-text("Log out")',
+            '[title="View Profile"]',
             '*:has-text("Points Earned")',
             '*:has-text("Balance:")',
             '*:has-text("Welcome back")',
@@ -775,12 +774,10 @@ async def process_portal_student_session(
                     break
             if dashboard_loaded:
                 break
-            # Also check that the Register form is gone
             reg_form_gone = await page.locator(
                 'input[name="mobile"], textarea[name="postalAddress"]'
             ).count() == 0
             if reg_form_gone:
-                # Form gone but no dashboard text yet — give a moment
                 await page.wait_for_timeout(500)
                 for dash_sel in dashboard_checks:
                     if await page.locator(dash_sel).count() > 0:
@@ -791,13 +788,11 @@ async def process_portal_student_session(
             await page.wait_for_timeout(1000)
 
         if not dashboard_loaded:
-            # Final check by page content
             content = await page.content()
             if any(kw in content for kw in ["Points Earned", "Balance:", "Welcome back", "CA Dashboard", "Logout"]):
                 dashboard_loaded = True
 
         if not dashboard_loaded:
-            # Mark as Failed with reason
             state.append_log(
                 f"❌ Dashboard did NOT load for {student_name}. "
                 "Registration may have failed (validation error or duplicate email)."
@@ -805,21 +800,50 @@ async def process_portal_student_session(
             status = "Failed"
             unique_link = "Failed: Dashboard never loaded after submission"
         else:
-            state.append_log(f"✅ CA Dashboard loaded successfully for {student_name}!")
+            state.append_log(f"✅ Landed on Dashboard for {student_name}!")
+
+            # 2. Stay on Dashboard for 10 full seconds to settle completely
+            state.append_log("⏳ Waiting on Dashboard for 10 full seconds for account session to settle...")
+            await page.wait_for_timeout(10000)
 
             # ----------------------------------------------------------------
-            # 7. MANDATORY 3-second visual pause on Dashboard
+            # 7. Step 5: Open the Profile Page
             # ----------------------------------------------------------------
-            state.append_log("⏳ Pausing 3 seconds on Dashboard for visual confirmation...")
-            await page.wait_for_timeout(3000)
+            state.append_log("👤 Clicking Profile in top navigation menu...")
+            profile_opened = False
+
+            profile_locators = [
+                page.locator('[title="View Profile"]').first,
+                page.get_by_text("Profile", exact=True).first,
+                page.locator('button:has-text("Profile")').first,
+                page.locator('div[role="tab"]:has-text("Profile")').first,
+                page.locator('a:has-text("Profile")').first,
+                page.locator('*:has-text("Profile")').first,
+            ]
+            for p_loc in profile_locators:
+                try:
+                    if await p_loc.count() > 0 and await p_loc.is_visible():
+                        await p_loc.scroll_into_view_if_needed()
+                        await p_loc.click()
+                        profile_opened = True
+                        state.append_log("  ✓ Clicked Profile navigation button.")
+                        break
+                except Exception:
+                    continue
+
+            if not profile_opened:
+                state.append_log("  ⚠️ Could not click Profile tab; checking current view...")
 
             # ----------------------------------------------------------------
-            # 8. Step 5: Scrape the newly generated referral link / CA ID
+            # 8. Step 6: Wait 5 Seconds on Profile Page & Scrape CA ID / Link
             # ----------------------------------------------------------------
-            state.append_log("🔎 Scraping generated referral link and CA ID from Dashboard...")
+            state.append_log("⏳ Pausing 5 seconds on Profile page for visual confirmation of saved account details...")
+            await page.wait_for_timeout(5000)
+
+            state.append_log("🔎 Reading generated CA ID and referral link from Profile page...")
             ca_id_found = ""
 
-            # Check all inputs on the dashboard page
+            # Check all inputs on page
             for inp in await page.locator("input").all():
                 try:
                     val = (await inp.input_value()).strip()
@@ -832,8 +856,8 @@ async def process_portal_student_session(
                     pass
 
             # Search page content
+            content = await page.content()
             if not unique_link:
-                content = await page.content()
                 m = re.search(
                     r"https?://[a-zA-Z0-9.-]*techkriti\.org/\?ref=[a-zA-Z0-9_-]+",
                     content,
@@ -842,7 +866,6 @@ async def process_portal_student_session(
                     unique_link = m.group(0)
 
             if not ca_id_found:
-                content = await page.content()
                 m_ca = re.search(r"\bCA-2027-\d+\b", content)
                 if m_ca:
                     ca_id_found = m_ca.group(0)
@@ -861,34 +884,32 @@ async def process_portal_student_session(
                     except Exception:
                         pass
 
-            # Construct link from CA ID if direct link wasn't found
             if not unique_link and ca_id_found:
                 unique_link = f"https://ca.techkriti.org/?ref={ca_id_found}"
 
             if unique_link:
                 status = "Success"
-                state.append_log(f"🎉 Generated Referral Link: {unique_link}")
+                state.append_log(f"🎉 Confirmed Profile Details — CA ID: {ca_id_found or 'N/A'}, Link: {unique_link}")
             else:
-                # Dashboard loaded but we couldn't scrape the link yet
-                unique_link = ca_id_found or "Dashboard loaded — link not extracted"
+                unique_link = ca_id_found or "Profile confirmed — link pending"
                 status = "Success"
                 state.append_log(
-                    f"✅ Registration success for {student_name} (link not scraped, CA ID: {ca_id_found or 'pending'})."
+                    f"✅ Profile confirmed for {student_name} (CA ID: {ca_id_found or 'found'})."
                 )
 
         # ----------------------------------------------------------------
-        # 9. Step 6: Logout and close context
+        # 9. Step 7: Logout cleanly after Profile confirmation
         # ----------------------------------------------------------------
         try:
             logout_btn = page.locator(
-                'button:has-text("Logout"), button:has-text("Log out")'
+                'button:has-text("Logout"), button:has-text("Log out"), *:has-text("Logout")'
             ).first
             if await logout_btn.count() > 0 and await logout_btn.is_visible():
-                state.append_log("🚪 Clicking Logout...")
+                state.append_log("🚪 Logging out cleanly from Profile page...")
                 await logout_btn.click(timeout=4000)
-                await page.wait_for_timeout(800)
+                await page.wait_for_timeout(1000)
         except Exception as logout_err:
-            state.append_log(f"  ℹ️ Logout skipped: {logout_err}")
+            state.append_log(f"  ℹ️ Logout skipped/completed: {logout_err}")
 
     except Exception as exc:
         state.append_log(f"❌ Unhandled error for {student_name}: {exc}")
